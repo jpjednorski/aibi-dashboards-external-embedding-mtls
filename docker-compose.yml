@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aibi-backend
+    ports:
+      - "5000:5000"
+    volumes:
+      # Mount source code for live reloading
+      - ./backend/app.py:/app/app.py:ro
+      - ./backend/.env:/app/.env:ro
+      # Exclude venv to avoid conflicts
+    environment:
+      - FLASK_ENV=development
+      - FLASK_DEBUG=1
+      - PYTHONUNBUFFERED=1
+    networks:
+      - aibi-network
+    restart: unless-stopped
+    command: python app.py
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: aibi-frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      # Mount source files for HMR (Hot Module Replacement)
+      - ./frontend/src:/app/src:ro
+      - ./frontend/index.html:/app/index.html:ro
+      - ./frontend/vite.config.js:/app/vite.config.js:ro
+      # Keep node_modules in container (don't override)
+      - /app/node_modules
+    environment:
+      - VITE_HMR_HOST=localhost
+    depends_on:
+      - nginx
+    networks:
+      - aibi-network
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    container_name: aibi-nginx
+    ports:
+      - "443:443"
+    volumes:
+      - ./backend/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - backend
+    networks:
+      - aibi-network
+    restart: unless-stopped
+    # Ensure nginx can be accessed from host machine
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+networks:
+  aibi-network:
+    driver: bridge

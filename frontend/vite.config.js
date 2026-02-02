@@ -6,13 +6,9 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 3000,
-    proxy: {
-      // Proxy API requests to Flask backend
-      '/api': {
-        target: 'http://localhost:5000',
-        changeOrigin: true,
-      }
-    }
+    host: '0.0.0.0',
+    // No proxy - frontend will make direct calls to https://localhost:443
+    // This allows the browser to present the client certificate to nginx
   }
 })
 
