@@ -122,7 +122,7 @@ sequenceDiagram
 
 **Key files:**
 - `backend/app.py` - Token minting & mTLS validation
-- `backend/nginx-mtls.conf` - mTLS proxy config
+- `backend/nginx.conf` - Nginx proxy config (mTLS on `/api`)
 - `frontend/src/App.jsx` - Main UI
 - `frontend/src/components/DashboardEmbed.jsx` - SDK integration
 

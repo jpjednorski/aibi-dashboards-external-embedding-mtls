@@ -58,8 +58,8 @@ const DashboardEmbed = ({ config, onError }) => {
           getNewToken: async () => {
             try {
               console.log('Token expiring, fetching fresh token...')
-              // Direct call to nginx endpoint (requires client cert)
-              const response = await axios.get('https://localhost:443/api/dashboard/embed-config')
+              // Same-origin call when served through nginx (mTLS enforced on /api)
+              const response = await axios.get('/api/dashboard/embed-config')
               console.log('Fresh token obtained successfully')
               return response.data.embed_token
             } catch (err) {
