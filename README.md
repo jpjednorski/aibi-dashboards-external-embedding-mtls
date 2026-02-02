@@ -82,6 +82,44 @@ Browser (with client cert)
     → Databricks (serves dashboard with RLS)
 ```
 
+```mermaid
+flowchart LR
+  subgraph Customer_Environment["Customer Environment (runs locally)"]
+    TV["TV / Browser with client cert"]
+    Nginx["Nginx (mTLS proxy)"]
+    App["Flask App (token minting)"]
+  end
+
+  subgraph Databricks_Cloud["Databricks Cloud"]
+    DB["Databricks Workspace\nDashboards + SQL Warehouse"]
+  end
+
+  TV -->|mTLS| Nginx
+  Nginx -->|forward headers| App
+  App -->|OAuth + embed token| DB
+  DB -->|dashboard data| TV
+```
+
+```mermaid
+sequenceDiagram
+  participant TV as TV/Browser
+  participant Nginx as Nginx (mTLS proxy)
+  participant App as Flask App
+  participant DB as Databricks Workspace
+
+  TV->>Nginx: TLS handshake with client cert
+  Nginx->>Nginx: Validate cert chain + CN/device id
+  Nginx->>App: Forward request + device headers
+  App->>App: Read service principal credentials (env)
+  App->>DB: OAuth client credentials grant
+  DB-->>App: Access token
+  App->>DB: Create embed token with device context
+  DB-->>App: Embed token
+  App-->>TV: Embed token for dashboard SDK
+  TV->>DB: Load dashboard with embed token
+  DB-->>TV: Dashboard renders successfully
+```
+
 **Key files:**
 - `backend/app.py` - Token minting & mTLS validation
 - `backend/nginx-mtls.conf` - mTLS proxy config
