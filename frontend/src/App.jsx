@@ -4,119 +4,117 @@ import DashboardEmbed from './components/DashboardEmbed'
 import './App.css'
 
 /**
- * Main application component for AI/BI External Embedding
- * 
+ * Main application component for AI/BI External Embedding (mTLS)
+ *
  * Handles:
- * - User authentication (login/logout)
  * - Fetching dashboard configuration and OAuth tokens from backend
- * - Rendering the DashboardEmbed component with user-specific tokens
- * - User switching to demonstrate row-level security
+ * - Rendering the DashboardEmbed component with device-bound tokens
  */
 const App = () => {
-  const [currentUser, setCurrentUser] = useState(null)
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
+  const [errorInfo, setErrorInfo] = useState(null)
+  const [errorDetails, setErrorDetails] = useState(null)
   const [dashboardConfig, setDashboardConfig] = useState(null)
 
-  // Dummy users available for switching
-  const AVAILABLE_USERS = [
-    { username: 'alice', name: 'Alice Johnson', department: 'Sales' },
-    { username: 'bob', name: 'Bob Smith', department: 'Engineering' }
-  ]
-
-  // Check if user is already logged in
   useEffect(() => {
-    checkCurrentUser()
+    fetchDashboardConfig()
   }, [])
 
   /**
-   * Check if user is already authenticated
-   */
-  const checkCurrentUser = async () => {
-    try {
-      const response = await axios.get('/api/auth/current-user', {
-        withCredentials: true
-      })
-      setCurrentUser(response.data)
-      await fetchDashboardConfig()
-    } catch (err) {
-      // User not logged in, that's okay
-      setLoading(false)
-    }
-  }
-
-  /**
-   * Login with username (simplified for demo)
-   */
-  const handleLogin = async (username) => {
-    setLoading(true)
-    setError(null)
-
-    try {
-      const response = await axios.post(
-        '/api/auth/login',
-        { username: username },
-        { withCredentials: true }
-      )
-
-      setCurrentUser(response.data.user)
-      await fetchDashboardConfig()
-    } catch (err) {
-      setError('Login failed. Please try again.')
-      console.error('Login error:', err)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  /**
-   * Logout current user
-   */
-  const handleLogout = async () => {
-    try {
-      await axios.post('/api/auth/logout', {}, { withCredentials: true })
-      setCurrentUser(null)
-      setDashboardConfig(null)
-      setLoading(false)  // Reset loading state
-      setError(null)     // Clear any errors
-    } catch (err) {
-      console.error('Logout error:', err)
-      setLoading(false)  // Reset loading even on error
-    }
-  }
-
-  /**
-   * Switch to a different user (for demo purposes)
-   */
-  const handleUserSwitch = async (username) => {
-    await handleLogout()
-    await handleLogin(username)
-  }
-
-  /**
    * Fetch dashboard embedding configuration from backend
-   * This includes the OAuth token minted for the current user
+   * This includes the OAuth token minted for the mTLS-authenticated device
+   * 
+   * Makes direct HTTPS call to nginx (https://localhost:443) so browser
+   * can present the client certificate during TLS handshake
    */
   const fetchDashboardConfig = async () => {
     setLoading(true)
-    setError(null)
+    setErrorInfo(null)
+    setErrorDetails(null)
 
     try {
-      const response = await axios.get('/api/dashboard/embed-config', {
-        withCredentials: true
-      })
+      // Call backend API (same origin when served through nginx)
+      const response = await axios.get('/api/dashboard/embed-config')
       setDashboardConfig(response.data)
     } catch (err) {
-      setError('Failed to load dashboard configuration.')
       console.error('Dashboard config error:', err)
+
+      const errorString = [
+        err?.name,
+        err?.message,
+        err?.code,
+        err?.cause?.message,
+        err?.cause,
+        err?.toString?.(),
+        String(err || '')
+      ].join(' ')
+      const isCertAuthorityError = /ERR_CERT_AUTHORITY_INVALID|CERT_AUTHORITY_INVALID/i.test(errorString)
+      const isNetworkError = /Network Error/i.test(err?.message || '') || err?.code === 'ERR_NETWORK'
+      const requestUrl = err?.config?.url || ''
+      const responseUrl = err?.request?.responseURL || ''
+      const isHttpsLocalhost = /^https:\/\/localhost(?::443)?\b/i.test(requestUrl)
+        || /^https:\/\/localhost(?::443)?\b/i.test(responseUrl)
+      const isLocalhostPage = typeof window !== 'undefined' && window.location?.hostname === 'localhost'
+      const isNoResponse = !err?.response
+      const isLikelyTlsHandshakeFailure = isNetworkError && (isHttpsLocalhost || isLocalhostPage)
+      const isRequestStatusZero = err?.request?.status === 0
+
+      setErrorDetails({
+        message: err?.message,
+        code: err?.code,
+        name: err?.name,
+        requestUrl,
+        responseUrl
+      })
+
+      // Handle different error scenarios with helpful messages
+      if (
+        isCertAuthorityError
+        || isLikelyTlsHandshakeFailure
+        || (isNetworkError && isNoResponse && (isHttpsLocalhost || isLocalhostPage))
+        || (isNetworkError && isRequestStatusZero && (isHttpsLocalhost || isLocalhostPage))
+      ) {
+        setErrorInfo({
+          kind: 'cert-authority',
+          message:
+            'Certificate Authority not trusted. Import certs/ca.crt into your system keychain and set it to Always Trust, then restart your browser.'
+        })
+      } else if (err?.response?.status === 400 || err?.message?.includes('400')) {
+        setErrorInfo({
+          kind: 'missing-cert',
+          message:
+            'Bad Request: No required SSL certificate was sent. Please ensure you have installed and selected the client certificate (factory-tv-01.p12) in your browser.'
+        })
+      } else if (err?.response?.status === 401) {
+        const errorData = err.response?.data
+        const errorMessage = errorData?.error || 'mTLS client certificate is required to view this dashboard.'
+        setErrorInfo({
+          kind: 'mtls-auth',
+          message: `Authentication Error: ${errorMessage}`
+        })
+      } else if (err?.response?.data?.error) {
+        // Display backend error message if available
+        setErrorInfo({
+          kind: 'backend',
+          message: `Error: ${err.response.data.error}`
+        })
+      } else if (err?.message) {
+        setErrorInfo({
+          kind: 'network',
+          message: `Error: ${err.message}`
+        })
+      } else {
+        setErrorInfo({
+          kind: 'generic',
+          message: 'Failed to load dashboard configuration. Please check your backend connection and credentials.'
+        })
+      }
     } finally {
       setLoading(false)
     }
   }
 
-
-  // Render loading state
-  if (loading && !currentUser) {
+  if (loading && !dashboardConfig) {
     return (
       <div className="app">
         <div className="loading">Loading...</div>
@@ -124,91 +122,62 @@ const App = () => {
     )
   }
 
-  // Render login screen if no user is authenticated
-  if (!currentUser) {
-    return (
-      <div className="app">
-        <div className="login-container">
-          <h1>AI/BI External Embedding</h1>
-          <p>Select a user to login:</p>
-          <div className="user-selection">
-            {AVAILABLE_USERS.map(user => (
-              <button
-                key={user.username}
-                onClick={() => handleLogin(user.username)}
-                className="user-button"
-              >
-                <div className="user-name">{user.name}</div>
-                <div className="user-dept">{user.department}</div>
-              </button>
-            ))}
-          </div>
-          {error && <div className="error">{error}</div>}
-        </div>
-      </div>
-    )
-  }
-
-  // Render main dashboard view
   return (
     <div className="app">
-      {/* Header with user info and controls */}
       <header className="header">
         <div className="header-content">
-          <h1>AI/BI External Embedding</h1>
-          
-          <div className="user-info">
-            <div className="current-user">
-              <strong>{currentUser.name}</strong>
-              <span className="user-department">{currentUser.department}</span>
-            </div>
-            
-            <div className="user-actions">
-              {/* Switch user dropdown */}
-              <select
-                onChange={(e) => handleUserSwitch(e.target.value)}
-                value=""
-                className="user-switch"
-              >
-                <option value="" disabled>Switch User</option>
-                {AVAILABLE_USERS
-                  .filter(u => u.username !== currentUser.email.split('@')[0])
-                  .map(user => (
-                    <option key={user.username} value={user.username}>
-                      {user.name} ({user.department})
-                    </option>
-                  ))
-                }
-              </select>
-              
-              <button onClick={handleLogout} className="logout-button">
-                Logout
-              </button>
-            </div>
-          </div>
+          <h1>AI/BI External Embedding (mTLS)</h1>
         </div>
       </header>
 
-      {/* Dashboard embedding container */}
       <main className="dashboard-container">
-        {error && <div className="error">{error}</div>}
-        
-        {dashboardConfig && (
+        {errorInfo && (
+          <div className="error">
+            <h3>⚠️ Error</h3>
+            <p>{errorInfo.message}</p>
+            {(errorInfo.kind === 'cert-authority' || errorInfo.kind === 'missing-cert') && (
+              <div className="error-help">
+                <h4>How to fix:</h4>
+                <ol>
+                  <li>Generate the PKCS#12 certificate bundle:
+                    <pre>openssl pkcs12 -export -in certs/factory-tv-01.crt -inkey certs/factory-tv-01.key -out certs/factory-tv-01.p12 -name "factory-tv-01"</pre>
+                  </li>
+                  <li>Install the certificate in your system keychain (macOS: double-click the .p12 file)</li>
+                  <li>Trust the CA certificate (macOS): open <code>certs/ca.crt</code> and set Always Trust</li>
+                  <li>Restart your browser</li>
+                  <li>When accessing the site, select the "factory-tv-01" certificate when prompted</li>
+                </ol>
+              </div>
+            )}
+            {errorDetails && (
+              <div className="error-help">
+                <h4>Debug details:</h4>
+                <pre>{JSON.stringify(errorDetails, null, 2)}</pre>
+              </div>
+            )}
+            <button onClick={fetchDashboardConfig} className="retry-button">
+              Retry
+            </button>
+          </div>
+        )}
+
+        {!errorInfo && dashboardConfig && (
           <div className="dashboard-info">
             <small>
               Viewing dashboard: {dashboardConfig.dashboard_id} | 
-              User context: {dashboardConfig.user_context.email}
+              Device context: {dashboardConfig.user_context.email} ({dashboardConfig.user_context.department})
             </small>
           </div>
         )}
-        
-        {/* Databricks dashboard embedded via DashboardEmbed component */}
-        <div className="dashboard-embed">
-          <DashboardEmbed 
-            config={dashboardConfig}
-            onError={setError}
-          />
-        </div>
+
+        {!errorInfo && (
+          <div className="dashboard-embed">
+            <DashboardEmbed
+              config={dashboardConfig}
+              onError={(message) => setErrorInfo({ kind: 'generic', message })}
+            />
+          </div>
+        )}
       </main>
     </div>
   )

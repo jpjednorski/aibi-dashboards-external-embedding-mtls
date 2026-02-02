@@ -8,10 +8,10 @@ import time
 import json
 import base64
 import urllib.parse
+import re
 from datetime import datetime
-from flask import Flask, jsonify, request, session
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from functools import wraps
 from dotenv import load_dotenv
 import requests
 
@@ -19,37 +19,106 @@ import requests
 load_dotenv('.env')
 
 app = Flask(__name__)
-app.secret_key = 'dev-secret-key-for-demo'  # Simple default for development
 app.config['DEBUG'] = True  # Development mode
 
-# Enable CORS for frontend communication
-CORS(app, supports_credentials=True, origins=['http://localhost:3000'])
+# Enable CORS for frontend communication (allow https://localhost:443 for mTLS flow)
+CORS(app, supports_credentials=False, origins=['http://localhost:3000', 'https://localhost:443'])
 
-# Dummy users for demonstration (simulating row-level security)
+# Demo users showing row-level security
+# Different departments will see different dashboard data
 DUMMY_USERS = {
-    'alice': {
-        'id': 'user_alice',
-        'name': 'Alice Johnson',
-        'email': 'alice@example.com',
-        'department': 'Sales'
+    'sales': {
+        'id': 'user_sales',
+        'name': 'Sales Team TV',
+        'email': 'sales-tv@example.com',
+        'department': 'AUTOMOBILE'
     },
-    'bob': {
-        'id': 'user_bob',
-        'name': 'Bob Smith',
-        'email': 'bob@example.com',
-        'department': 'Engineering'
+    'machinery': {
+        'id': 'user_machinery',
+        'name': 'Machinery Team TV',
+        'email': 'machinery-tv@example.com',
+        'department': 'MACHINERY'
+    },
+    'furniture': {
+        'id': 'user_furniture',
+        'name': 'Furniture Team TV',
+        'email': 'furniture-tv@example.com',
+        'department': 'FURNITURE'
     }
 }
 
 
-def login_required(f):
-    """Decorator to ensure user is authenticated"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if 'user_id' not in session:
-            return jsonify({'error': 'Authentication required'}), 401
-        return f(*args, **kwargs)
-    return decorated_function
+def _load_json_map(env_var_name):
+    """Load a JSON object from an environment variable."""
+    raw = os.environ.get(env_var_name)
+    if not raw:
+        return None, None
+    try:
+        return json.loads(raw), None
+    except json.JSONDecodeError as exc:
+        return None, f"Invalid JSON in {env_var_name}: {exc}"
+
+
+def _get_user_from_mtls_headers(headers):
+    """
+    Resolve user context from mTLS verification headers set by a reverse proxy.
+    Requires mTLS verification to be successful.
+    """
+    verify_status = headers.get('X-Client-Verify')
+    if verify_status != 'SUCCESS':
+        return None, "Client certificate verification failed"
+
+    subject_dn = headers.get('X-Client-Subject-Dn')
+    cert_sha256 = headers.get('X-Client-Cert-Sha256')
+    cert_fingerprint = headers.get('X-Client-Cert-Fingerprint')
+
+    subject_map, subject_err = _load_json_map('MTLS_SUBJECT_TO_USER_JSON')
+    if subject_err:
+        return None, subject_err
+
+    sha_map, sha_err = _load_json_map('MTLS_SHA256_TO_USER_JSON')
+    if sha_err:
+        return None, sha_err
+
+    fingerprint_map, fingerprint_err = _load_json_map('MTLS_FINGERPRINT_TO_USER_JSON')
+    if fingerprint_err:
+        return None, fingerprint_err
+
+    def normalize_subject_dn(value):
+        if not value:
+            return value
+        normalized = value.strip()
+        if normalized.startswith('/'):
+            normalized = normalized.lstrip('/').replace('/', ',')
+        normalized = re.sub(r'\s*=\s*', '=', normalized)
+        normalized = re.sub(r',\s*', ',', normalized)
+        return normalized
+
+    user = None
+    if subject_dn and subject_map:
+        normalized_subject_dn = normalize_subject_dn(subject_dn)
+        user = subject_map.get(subject_dn) or subject_map.get(normalized_subject_dn)
+    if not user and cert_sha256 and sha_map:
+        user = sha_map.get(cert_sha256)
+    if not user and cert_fingerprint and fingerprint_map:
+        user = fingerprint_map.get(cert_fingerprint)
+
+    if not user:
+        normalized_subject_dn = normalize_subject_dn(subject_dn) if subject_dn else None
+        if subject_dn:
+            return None, (
+                "No user mapping for client certificate. "
+                f"Subject DN: {subject_dn} "
+                f"(normalized: {normalized_subject_dn})"
+            )
+        return None, "No user mapping for client certificate"
+
+    required_fields = {'id', 'name', 'email', 'department'}
+    missing_fields = required_fields - set(user.keys())
+    if missing_fields:
+        return None, f"User mapping missing fields: {', '.join(sorted(missing_fields))}"
+
+    return user, None
 
 
 def mint_databricks_token(user_data):
@@ -109,7 +178,7 @@ def mint_databricks_token(user_data):
     
     if oidc_response.status_code != 200:
         raise Exception(f"Failed to get OIDC token: {oidc_response.status_code} - {oidc_response.text}")
-    
+    print(f"oidc_response.status_code: {oidc_response.status_code}")
     oidc_token = oidc_response.json()["access_token"]
     
     # Step 2: Get token info for the dashboard with user context
@@ -121,7 +190,7 @@ def mint_databricks_token(user_data):
         f"?external_viewer_id={urllib.parse.quote(user_data['email'])}"
         f"&external_value={urllib.parse.quote(user_data['department'])}"
     )
-    
+    print(f"Token info URL: {token_info_url}")
     token_info_response = requests.get(
         token_info_url,
         headers={"Authorization": f"Bearer {oidc_token}"}
@@ -131,10 +200,12 @@ def mint_databricks_token(user_data):
         raise Exception(f"Failed to get token info: {token_info_response.status_code} - {token_info_response.text}")
     
     token_info = token_info_response.json()
+    print(f"Token info response: {json.dumps(token_info, indent=2)}")
     
     # Step 3: Generate scoped token with authorization details
     params = token_info.copy()
     authorization_details = params.pop("authorization_details", None)
+    print(f"Authorization details: {json.dumps(authorization_details, indent=2)}")
     params.update({
         "grant_type": "client_credentials",
         "authorization_details": json.dumps(authorization_details)
@@ -162,76 +233,37 @@ def mint_databricks_token(user_data):
     }
 
 
-@app.route('/api/auth/login', methods=['POST'])
-def login():
-    """
-    Authenticate user by username only (simplified for demo).
-    In production, integrate with your actual authentication system.
-    """
-    data = request.get_json()
-    username = data.get('username')
-    
-    # Validate username exists
-    user = DUMMY_USERS.get(username)
-    if not user:
-        return jsonify({'error': 'Invalid username'}), 401
-    
-    # Create session
-    session['user_id'] = user['id']
-    session['username'] = username
-    
-    return jsonify({
-        'success': True,
-        'user': {
-            'id': user['id'],
-            'name': user['name'],
-            'email': user['email'],
-            'department': user['department']
-        }
-    })
-
-
-@app.route('/api/auth/logout', methods=['POST'])
-def logout():
-    """Clear user session"""
-    session.clear()
-    return jsonify({'success': True})
-
-
-@app.route('/api/auth/current-user', methods=['GET'])
-@login_required
-def get_current_user():
-    """Get currently authenticated user info"""
-    username = session.get('username')
-    user = DUMMY_USERS.get(username)
-    
-    return jsonify({
-        'id': user['id'],
-        'name': user['name'],
-        'email': user['email'],
-        'department': user['department']
-    })
-
-
 @app.route('/api/dashboard/embed-config', methods=['GET'])
-@login_required
 def get_embed_config():
     """
     Provide dashboard embedding configuration and token.
     
     This endpoint:
-    1. Retrieves the current user from session
-    2. Mints a fresh Databricks OAuth token for that user
-    3. Returns dashboard configuration and token to frontend
+    1. Verifies mTLS client certificate (via proxy headers from nginx)
+    2. Maps client identity to a user context
+    3. Mints a fresh Databricks OAuth token for that user
+    4. Returns dashboard configuration and token to frontend
     
     The frontend will use this information to initialize the
     Databricks embedding SDK.
     """
-    username = session.get('username')
-    user = DUMMY_USERS.get(username)
     
-    # Mint fresh token for the current user
-    token_data = mint_databricks_token(user)
+    # Verify mTLS headers from nginx
+    user, error = _get_user_from_mtls_headers(request.headers)
+    if error:
+        print(f"❌ mTLS verification failed: {error}")
+        return jsonify({'error': error}), 401
+
+    print(f"✅ Authenticated as: {user['name']} ({user['email']})")
+
+    try:
+        # Mint fresh token for the current user
+        token_data = mint_databricks_token(user)
+        print(f"✅ Token minted successfully for {user['email']}")
+    except Exception as e:
+        error_message = str(e)
+        print(f"❌ Token minting failed: {error_message}")
+        return jsonify({'error': error_message}), 500
     
     # Dashboard configuration
     dashboard_config = {
@@ -262,12 +294,15 @@ def health_check():
 
 
 if __name__ == '__main__':
-    # Run Flask development server
+    # Run Flask development server with auto-reload
+    # Changes to app.py will automatically restart the server
     # In production, use a production WSGI server like Gunicorn
     app.run(
         host='0.0.0.0',
         port=5000,
-        debug=True
+        debug=True,
+        use_reloader=True,
+        use_debugger=True
     )
 
 
